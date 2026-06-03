@@ -47,6 +47,12 @@ ATR_INIT_STOP     = 2.0    # initial stop = entry - k*ATR
 ATR_TRAIL         = 3.0    # chandelier trail = highest_high_since_entry - k*ATR
 MAX_HOLD_DAYS     = 30     # time stop (your 2-30 day horizon)
 
+RSI_LEN           = 14     # overbought/oversold. CONTEXT ONLY -- not an entry filter.
+RSI_EXTENDED      = 80     # flag a breakout as "extended" above this (caution, not a veto)
+CMF_LEN           = 20     # Chaikin Money Flow window (buying vs selling pressure proxy)
+REQUIRE_POSITIVE_CMF = True  # require net accumulation on the breakout. A/B test this:
+                             # set False, re-run, and compare expectancy to see if it helps.
+
 COMMISSION = 0.001         # 0.1% per side  (slippage + fees proxy; raise for India)
 CASH       = 100_000
 
@@ -87,6 +93,25 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(ATR_LEN).mean()
 
+    # RSI (Wilder) -- overbought/oversold. CONTEXT ONLY for a breakout system:
+    # strong momentum names are SUPPOSED to read high. We display it, we do not
+    # filter entries on it (filtering would throw away your best winners).
+    delta = c.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / RSI_LEN, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / RSI_LEN, adjust=False).mean()
+    rs_ratio = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI"] = (100 - 100 / (1 + rs_ratio)).fillna(100)
+
+    # Chaikin Money Flow -- buying vs selling pressure PROXY from OHLCV.
+    # Money-flow multiplier: +1 when close prints at the high (buyers won the
+    # day), -1 at the low (sellers won). CMF>0 = net accumulation over the window.
+    rng = (h - l).replace(0, np.nan)
+    mfm = (((c - l) - (h - c)) / rng).fillna(0.0)
+    mfv = mfm * v
+    df["CMF"] = mfv.rolling(CMF_LEN).sum() / v.rolling(CMF_LEN).sum()
+
     # prior N-day high (excludes today -> no look-ahead)
     prior_high = h.rolling(BREAKOUT_LOOKBACK).max().shift(1)
     vol_avg     = v.rolling(BREAKOUT_LOOKBACK).mean().shift(1)
@@ -96,11 +121,16 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # CONFIRMATION: yesterday was a breakout day, today still holds above the
     # level it broke, and trend filter holds today.
-    df["EntrySignal"] = (
+    confirm = (
         breakout_day.shift(1).fillna(False)
         & (c > prior_high.shift(1))
         & trend_ok
     )
+    # Optional: require the breakout to be on net buying pressure, not distribution.
+    if REQUIRE_POSITIVE_CMF:
+        confirm = confirm & (df["CMF"] > 0)
+
+    df["EntrySignal"] = confirm
     return df
 
 
